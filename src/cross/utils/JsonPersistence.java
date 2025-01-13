@@ -41,7 +41,6 @@ public class JsonPersistence {
     }
     
     //salva utenti su file JSON, stesso formato
-    
     public static void saveUsers(String filename, Map<String,String> userMap){
         Map<String, Object> root = new HashMap<>();
         root.put("users", userMap);

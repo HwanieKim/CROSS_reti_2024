@@ -467,56 +467,53 @@ public class CrossClient {
     }
     
     //---- handling notification ----
-    private class NotificationListener implements Runnable {
-        private final DatagramSocket socket;
-        public NotificationListener(DatagramSocket socket) {
-            this.socket = socket;
-        }
+        private record NotificationListener(DatagramSocket socket) implements Runnable {
         @Override
-        public void run() {
-            byte[] buf = new byte[65535];
-            while(!socket.isClosed()){
-                DatagramPacket packet = new DatagramPacket(buf, buf.length);
-                try{
-                    socket.receive(packet);
-                    String msg = new String(packet.getData(), 0, packet.getLength());
-                    handleNotification(msg);
-                } catch (IOException e){
-                    if(socket.isClosed()){
-                        break;
+            public void run() {
+                byte[] buf = new byte[65535]; //dimensione massima per un pacchetto UDP (16 bit), inclusi header e payload
+                while (!socket.isClosed()) {
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    try {
+                        socket.receive(packet);
+                        String msg = new String(packet.getData(), 0, packet.getLength());
+                        handleNotification(msg);
+                    } catch (IOException e) {
+                        if (socket.isClosed()) {
+                            break;
+                        }
+                        System.err.println("[CrossClient - NotificationListener] error in receiving UDP: " + e.getMessage());
+                        e.printStackTrace();
                     }
-                    System.err.println("[CrossClient - NotificationListener] error in receiving UDP: "+e.getMessage());
+                }
+            }
+        
+        //gestione notifica ricevuta via UDP
+            private void handleNotification(String msg) {
+                //le notifiche dal server sono JSON con un array di "TRADES"
+                // ogni trade ha: orderId, type, orderType, size, price, timestamp
+                try {
+                    JsonObject json = JsonParser.parseString(msg).getAsJsonObject();
+                    if (!json.has("trades")) {
+                        System.err.println("[CrossClient - handleNotification] error in JSON: doesnt' exists 'trades'");
+                        return;
+                    }
+                    var trades = json.getAsJsonArray("trades");
+                    for (var tradeElement : trades) {
+                        JsonObject trade = tradeElement.getAsJsonObject();
+                        int orderId = trade.get("orderId").getAsInt();
+                        String type = trade.get("type").getAsString();
+                        String orderType = trade.get("orderType").getAsString();
+                        int size = trade.get("size").getAsInt();
+                        int price = trade.get("price").getAsInt();
+                        long timestamp = trade.get("timestamp").getAsLong();
+                        
+                        System.out.println("\n[TRADE NOTIFICATION] order Id: " + orderId + " | Tipo " + type + " | Order Type " + orderType + " | size " + size + " | Price " + price + " | Timestamp " + timestamp);
+                        System.out.print("> ");
+                    }
+                } catch (Exception e) {
+                    System.out.println("[CrossClient - handleNotification] error in notification handling: " + e.getMessage());
                     e.printStackTrace();
                 }
             }
         }
-        //gestione notifica ricevuta via UDP
-        private void handleNotification(String msg){
-            //le notifiche dal server sono JSON con un array di "TRADES"
-            // ogni trade ha: orderId, type, orderType, size, price, timestamp
-            try{
-                JsonObject json = JsonParser.parseString(msg).getAsJsonObject();
-                if(!json.has("trades")){
-                    System.err.println("[CrossClient - handleNotification] error in JSON: doesnt' exists 'trades'");
-                    return;
-                }
-                var trades = json.getAsJsonArray("trades");
-                for( var tradeElement : trades){
-                    JsonObject trade = tradeElement.getAsJsonObject();
-                    int orderId = trade.get("orderId").getAsInt();
-                    String type = trade.get("type").getAsString();
-                    String orderType = trade.get("orderType").getAsString();
-                    int size = trade.get("size").getAsInt();
-                    int price = trade.get("price").getAsInt();
-                    long timestamp = trade.get("timestamp").getAsLong();
-                    
-                    System.out.println("\n[TRADE NOTIFICATION] order Id: " + orderId + " | Tipo "+ type + " | Order Type "+ orderType + " | size " + size + " | Price " + price + " | Timestamp " + timestamp);
-                    System.out.print("> ");
-                }
-            } catch (Exception e){
-                System.out.println("[CrossClient - handleNotification] error in notification handling: "+e.getMessage());
-                e.printStackTrace();
-            }
-        }
-    }
 }

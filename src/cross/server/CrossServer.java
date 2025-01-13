@@ -10,6 +10,8 @@ import java.net.DatagramSocket;
 import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 
 public class CrossServer {
@@ -55,6 +57,8 @@ public class CrossServer {
     
     //flag per gestione stato server
     private volatile boolean isRunning;
+    //true per fairness, first-come, first-served
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock(true);
     
     public CrossServer(int port) throws IOException {
         this.port = port;
@@ -124,9 +128,14 @@ public class CrossServer {
     
     //salvataggio dati su file JSON (utenti e trades eseguiti)
     private void persistData() {
-        JsonPersistence.saveUsers(USER_FILE, userMap);
-        JsonPersistence.saveTrades(TRADES_FILE,executedTrades);
-        System.out.println("[CrossServer - persistData] SERVER: COMPLETED PERIODIC DATA SAVE");
+        rwLock.writeLock().lock();
+        try {
+            JsonPersistence.saveUsers(USER_FILE, userMap);
+            JsonPersistence.saveTrades(TRADES_FILE, executedTrades);
+            System.out.println("[CrossServer - persistData] SERVER: COMPLETED PERIODIC DATA SAVE");
+        } finally{
+            rwLock.writeLock().unlock();
+        }
     }
     
     //stop server
@@ -171,13 +180,6 @@ public class CrossServer {
     public JsonObject handleRegister(String username, String password){
         JsonObject response = new JsonObject();
         
-        //controllo esistenza utente
-        if(userMap.containsKey(username)) {
-            response.addProperty("response",102);
-            response.addProperty("errorMessage", "[CrossServer - register] Username unavailable");
-            return response;
-        }
-        
         //validazione password: almeno 6 caratteri/ almeno un numero e un carattere speciale
         if(password.length()<6 || !password.matches("^(?=.*[0-9])(?=.*[!@#$%^&*]).+$")){
             response.addProperty("response",101);
@@ -185,8 +187,19 @@ public class CrossServer {
             return response;
         }
         
-        //aggiunta utente
-        userMap.put(username, password);
+        rwLock.writeLock().lock();
+        try{
+            // Tentativo atomico di aggiunta utente
+            String previousValue = userMap.putIfAbsent(username, password);
+            if (previousValue != null) {
+                response.addProperty("response", 102);
+                response.addProperty("errorMessage", "[CrossServer - register] Username unavailable");
+                return response;
+            }
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+        
         response.addProperty("response",100);
         response.addProperty("errorMessage", "OK");
         
@@ -200,22 +213,25 @@ public class CrossServer {
     public JsonObject handleLogin(String username, String password, String udpIp, int udpPort){
         JsonObject response = new JsonObject();
         
-        //verifica esistenza utente/validita' password
-        if(!userMap.containsKey(username) || !userMap.get(username).equals(password)) {
-            response.addProperty("response",101);
-            response.addProperty("errorMessage", "[CrossServer - login] Username/password mismatch");
-            return response;
+        //acquisizione readLock prima di lettura
+        rwLock.readLock().lock();
+        try{
+            //verifica esistenza utente/validita' password
+            if(!userMap.containsKey(username) || !userMap.get(username).equals(password)) {
+                response.addProperty("response",101);
+                response.addProperty("errorMessage", "[CrossServer - login] Username/password mismatch");
+                return response;
+            }
+        } finally {
+            rwLock.readLock().unlock();
         }
         
-        //verifica se l'utente e' gia' loggato
-        if(loggedUsers.contains(username)) {
+        //verifica se l'utente e' gia' loggato se no, aggiungi. concurrentHashMap.newKeySet().add funziona come putIfAbsent
+        if(!loggedUsers.add(username)) {
             response.addProperty("response",102);
             response.addProperty("errorMessage", "[CrossServer - login] Username already logged in");
             return response;
         }
-        
-        //aggiungi utente tra i loggedIn
-        loggedUsers.add(username);
         
         //registra info per notifica
         registerNotification(username,udpIp,udpPort);
@@ -232,15 +248,12 @@ public class CrossServer {
     public JsonObject handleLogout(String username){
         JsonObject response = new JsonObject();
         
-        //verifica utente loggato
-        if(!loggedUsers.contains(username)) {
+        //verifica utente loggato ed eventuale rimozione
+        if(!loggedUsers.remove(username)) {
             response.addProperty("response",105);
             response.addProperty("errorMessage", "[CrossServer - logout] Username not logged in");
             return response;
         }
-        
-        //rimozione dagli utenti loggati
-        loggedUsers.remove(username);
         
         //rimozione info per notifica
         clientNotifications.remove(username);
@@ -256,101 +269,125 @@ public class CrossServer {
     public JsonObject handleUpdateCredentials(String username, String oldPassword, String newPassword){
         JsonObject response = new JsonObject();
         
-        //verifica esistenza utente e corretta password attuale
-        if(!userMap.containsKey(username) || !userMap.get(username).equals(oldPassword)) {
-            response.addProperty("response",102);
+        rwLock.writeLock().lock();
+        try{
+            //controllo password nuova
+            if(newPassword.equals(oldPassword)) {
+                response.addProperty("response",103);
+                response.addProperty("errorMessage", "[CrossServer - update] New password cannot be the same as the old password");
+                return response;
+            }
+            
+            //validazione nuova password
+            if(newPassword.length() < 6 || !newPassword.matches("^(?=.*[0-9])(?=.*[!@#$%^&*]).+$")){
+                response.addProperty("response",101);
+                response.addProperty("errorMessage", "[CrossServer - update] Invalid new password: must be at least 6 characters and include a number and a special character");
+                return response;
+            }
+         
+            
+            //verifica utente loggato
+            if(loggedUsers.contains(username)) {
+                response.addProperty("response",104);
+                response.addProperty("errorMessage", "[CrossServer - update] Username currently logged in");
+                return response;
+            }
+            boolean updated = userMap.replace(username,oldPassword,newPassword);
+            if(!updated){
+                response.addProperty("response",102);
+                response.addProperty("errorMessage", "OK");
+                return response;
+            }
+            response.addProperty("response",100);
             response.addProperty("errorMessage", "[CrossServer - update] Username or old password mismatch");
+            
+            
+            persistData();
+            
             return response;
+            
+            } finally {
+            rwLock.writeLock().unlock();
         }
-        
-        //verifica utente loggato
-        if(loggedUsers.contains(username)) {
-            response.addProperty("response",104);
-            response.addProperty("errorMessage", "[CrossServer - update] Username currently logged in");
-            return response;
-        }
-        
-        //verifica newPassword != oldPassword
-        if(newPassword.equals(oldPassword)) {
-            response.addProperty("response",103);
-            response.addProperty("errorMessage", "[CrossServer - update] New password cannot be the same as the old password");
-            return response;
-        }
-        
-        //validazione nuova password
-        if(newPassword.length() < 6 || !newPassword.matches("^(?=.*[0-9])(?=.*[!@#$%^&*]).+$")){
-            response.addProperty("response",101);
-            response.addProperty("errorMessage", "[CrossServer - update] Invalid new password: must be at least 6 characters and include a number and a special character");
-            return response;
-        }
-        
-        userMap.put(username, newPassword);
-        response.addProperty("response",100);
-        response.addProperty("errorMessage", "OK");
-        
-        persistData();
-        
-        return response;
     }
     public void insertLimitOrder(Order order){
-        matchLimitOrder(order);
-        if(order.getRemainingSize() > 0){
+        rwLock.writeLock().lock();
+        try{
+            matchLimitOrder(order);
+            if(order.getRemainingSize() > 0){
             addToBook(order);
+            }
+        } finally {
+            rwLock.writeLock().unlock();
         }
     }
     
     public boolean insertMarketOrder(Order order){
-        //verifica se il marketOder puo' essere eseguito completamente
-        int totalAvailableSize = 0;
-        if(order.getType().equals("ask")){
-            for(Map.Entry<Integer,ConcurrentLinkedQueue<Order>> entry: bidBook.entrySet()){
-                for(Order bidOrder: entry.getValue()){
-                    totalAvailableSize += bidOrder.getRemainingSize();
-                    if(totalAvailableSize >= order.getSize()){
+        rwLock.writeLock().lock();
+        try {
+            //verifica se il marketOder puo' essere eseguito completamente
+            int totalAvailableSize = 0;
+            if (order.getType().equals("ask")) {
+                for (Map.Entry<Integer, ConcurrentLinkedQueue<Order>> entry : bidBook.entrySet()) {
+                    for (Order bidOrder : entry.getValue()) {
+                        totalAvailableSize += bidOrder.getRemainingSize();
+                        if (totalAvailableSize >= order.getSize()) {
+                            break;
+                        }
+                    }
+                    if (totalAvailableSize >= order.getSize()) {
                         break;
                     }
                 }
-                if(totalAvailableSize >= order.getSize()){
-                    break;
-                }
-            }
-        } else { //lato bid
-            for(Map.Entry<Integer,ConcurrentLinkedQueue<Order>> entry: askBook.entrySet()){
-                for(Order askOrder: entry.getValue()){
-                    totalAvailableSize += askOrder.getRemainingSize();
-                    if(totalAvailableSize >= order.getSize()){
+            } else { //lato bid
+                for (Map.Entry<Integer, ConcurrentLinkedQueue<Order>> entry : askBook.entrySet()) {
+                    for (Order askOrder : entry.getValue()) {
+                        totalAvailableSize += askOrder.getRemainingSize();
+                        if (totalAvailableSize >= order.getSize()) {
+                            break;
+                        }
+                    }
+                    if (totalAvailableSize >= order.getSize()) {
                         break;
                     }
                 }
-                if(totalAvailableSize >= order.getSize()){
-                    break;
-                }
             }
+            if (totalAvailableSize < order.getSize()) {
+                //ordine scartato
+                System.out.println("[CrossServer - insertMarket] Market Order discarded: size not fully executable");
+                return false;
+            }
+            matchLimitOrder(order);
+            return true;
+        } finally {
+            rwLock.writeLock().unlock();
         }
-        if(totalAvailableSize < order.getSize()){
-            //ordine scartato
-            System.out.println("[CrossServer - insertMarket] Market Order discarded: size not fully executable");
-            return false;
-        }
-        matchLimitOrder(order);
-        return true;
     }
     
     public void insertStopOrder(Order order){
-        synchronized (stopOrders){
+        rwLock.writeLock().lock();
+        try{
             stopOrders.add(order);
+        } finally {
+            rwLock.writeLock().unlock();
         }
     }
     
     // rimuove un ordine (non eseguito) dal book o dalla lista stop.
     // ritorna true se trovato e rimosso, altrimenti false
-    public boolean cancelOrder(int orderId){
-        //dalla book
-        boolean removed = removeFromBook(orderId,askBook);
-        if(!removed) removed = removeFromBook(orderId,bidBook);
-        if(!removed) removed = removeFromStopOrders(orderId); //dalla list stop
-        return removed;
+    public boolean cancelOrder(int orderId) {
+        rwLock.writeLock().lock();
+        try {
+            //dalla book
+            boolean removed = removeFromBook(orderId, askBook);
+            if (!removed) removed = removeFromBook(orderId, bidBook);
+            if (!removed) removed = removeFromStopOrders(orderId); //dalla list stop
+            return removed;
+        } finally {
+            rwLock.writeLock().unlock();
+        }
     }
+    
     
     /*matching di limit order
     * selling: type = ask, to be get matched, best bidding(buying) price should be greater or equal than asking(selling) price,
@@ -360,6 +397,7 @@ public class CrossServer {
     * therefor bestAsk <= bidPrice
     */
     private void matchLimitOrder(Order incoming){
+        //lock gia' acquisita dal chiamante (writelock)
         //caso ask (vendita)
         if(incoming.getType().equals("ask")){
             while(incoming.getRemainingSize() > 0) {
@@ -429,6 +467,7 @@ public class CrossServer {
     * buying: type = bid => contro gli ask
     * */
     private void matchMarketOrder(Order incoming){
+        //lock gia' acquisita dal chiamante (writelock)
         if(incoming.getType().equals("ask")){
             while(incoming.getRemainingSize() > 0) {
                 Map.Entry<Integer, ConcurrentLinkedQueue<Order>> bestBidEntry = bidBook.firstEntry();
@@ -487,12 +526,12 @@ public class CrossServer {
     
     //ogni volta che cambia lastPrice, controlliamo se scatta qualche stopOrder
     private void checkStopOrders(){
-        synchronized(stopOrders){
+        rwLock.writeLock().lock();
+        try{
             Iterator<Order> iterator = stopOrders.iterator();
             while(iterator.hasNext()){
                 Order order = iterator.next();
                 try{
-                
                 if(order.getType().equals("ask")){
                     System.out.println("Activating Stop Ask Order ID: " + order.getOrderId() + " | Size: " + order.getRemainingSize() + " | Stop Price: " + order.getPrice());
                     //lastPrice <= stopPrice
@@ -516,12 +555,15 @@ public class CrossServer {
                     e.printStackTrace();
                 }
             }
+        } finally {
+            rwLock.writeLock().unlock();
         }
     }
     
     //esecuzione trade di dimensione tradeSize al prezzo price, tra un orderAsk e un orderBid
     private void executeTrade(Order bidSide, Order askSide, int price, int tradeSize){
-    //assumiamo che bidSide sia sempre "bid" e askSide sia sempre "ask", garantita dal matching
+        //gia' protetto dal write lock del chiamante (matchLimitOrder/matchMarketOrder)
+        //assumiamo che bidSide sia sempre "bid" e askSide sia sempre "ask", garantita dal matching
         try{
         //esecuzione fill
         bidSide.fill(tradeSize);
@@ -556,9 +598,12 @@ public class CrossServer {
                 timeStamp);            //timestamp
         
         //salavtaggio ordine nello salavataggio
-        synchronized (executedTrades){
+        rwLock.writeLock().lock();
+        try{
             executedTrades.add(bidTrade);
             executedTrades.add(askTrade);
+        } finally {
+            rwLock.writeLock().unlock();
         }
         
         //invio notifica via UDP
@@ -592,12 +637,13 @@ public class CrossServer {
         tradeObj.put("timestamp", trade.getTimestamp());
         
         Map<String,Object> root = new HashMap<>();
-        root.put("trades", Collections.singletonList(trade));
+        root.put("trades", Collections.singletonList(tradeObj));
         return gson.toJson(root);
     }
     
     //aggiunge un limitOrder non completamente evaso al book corrispondente
     private void addToBook(Order order){
+        //protetto da writeLock del chiamante
         if(order.getType().equals("ask")){
             askBook.computeIfAbsent(order.getPrice(), k -> new ConcurrentLinkedQueue<>()).add(order);
         } else {
@@ -607,8 +653,10 @@ public class CrossServer {
     
     //rimuove un ordine dal book, se presente e non completamente eseguito
     private boolean removeFromBook(int OrderId, ConcurrentSkipListMap<Integer, ConcurrentLinkedQueue<Order>> book){
+        //lock gia' acquisito
         for(Map.Entry<Integer,ConcurrentLinkedQueue<Order>> entry: book.entrySet()){
             ConcurrentLinkedQueue<Order> list = entry.getValue();
+            //rimuoviamo se troviamo l'ordine
             Iterator<Order> iterator = list.iterator();
             while(iterator.hasNext()){
                 Order order = iterator.next();
@@ -627,7 +675,7 @@ public class CrossServer {
     
 
     private boolean removeFromStopOrders(int orderId){
-        synchronized(stopOrders){
+        //lock gia' acquisto
             Iterator<Order> iterator = stopOrders.iterator();
             while(iterator.hasNext()){
                 Order order = iterator.next();
@@ -636,7 +684,6 @@ public class CrossServer {
                     return true;
                 }
             }
-        }
         return false;
     }
     
