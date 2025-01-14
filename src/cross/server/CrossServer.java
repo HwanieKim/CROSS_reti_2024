@@ -142,6 +142,7 @@ public class CrossServer {
     public void stop(){
         isRunning = false;
         try{
+            persistData();
             if(serverSocket != null && !serverSocket.isClosed()) {
                 serverSocket.close();
             }
