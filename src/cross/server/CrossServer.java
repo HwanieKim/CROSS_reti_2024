@@ -537,18 +537,56 @@ public class CrossServer {
                     System.out.println("Activating Stop Ask Order ID: " + order.getOrderId() + " | Size: " + order.getRemainingSize() + " | Stop Price: " + order.getPrice());
                     //lastPrice <= stopPrice
                     if(lastPrice <= order.getPrice()){
+                        int totalAvailable = 0;
+                        for(Map.Entry<Integer, ConcurrentLinkedQueue<Order>> entry : bidBook.entrySet()){
+                            for(Order bidOrder : entry.getValue()){
+                                totalAvailable += bidOrder.getRemainingSize();
+                                if(totalAvailable >= order.getRemainingSize()){
+                                    break;
+                                }
+                            }
+                            if(totalAvailable >= order.getRemainingSize()){
+                                break;
+                            }
+                        }
+                        if(totalAvailable < order.getRemainingSize()){
+                            System.out.println("[CrossServer - checkStop] Stop Ask Order ID: " + order.getOrderId() +
+                                    " discarded: size not fully executable (required: " + order.getRemainingSize() +
+                                    ", available: " + totalAvailable + ")");
+                            iterator.remove();
+                        } else{
                         //converti in market, price = 0 va bene perche' il prezzo sara' quello del mercato
                         Order market = new Order(order.getOrderId(), "ask", order.getRemainingSize(), 0, "market", order.getOwner());
                         iterator.remove();
                         matchMarketOrder(market);
+                        }
                     }
                 } else {
                     //type: bid, scatta se lastPrice >= stopPrice
-                    if(lastPrice >= order.getPrice()){
-                        System.out.println("Activating Stop Bid Order ID: " + order.getOrderId() + " | Size: " + order.getRemainingSize() + " | Stop Price: " + order.getPrice());
-                        Order market = new Order(order.getOrderId(), "bid", order.getRemainingSize(), 0, "market", order.getOwner());
-                        iterator.remove();
-                        matchMarketOrder(market);
+                    if(lastPrice >= order.getPrice()) {
+                        int totalAvailable = 0;
+                        for (Map.Entry<Integer, ConcurrentLinkedQueue<Order>> entry : askBook.entrySet()) {
+                            for (Order askOrder : entry.getValue()) {
+                                totalAvailable += askOrder.getRemainingSize();
+                                if (totalAvailable >= order.getRemainingSize()) {
+                                    break;
+                                }
+                            }
+                            if (totalAvailable >= order.getRemainingSize()) {
+                                break;
+                            }
+                        }
+                        if (totalAvailable < order.getRemainingSize()) {
+                            System.out.println("[CrossServer - checkStop] Stop Bid Order ID: " + order.getOrderId() +
+                                    " discarded: size not fully executable (required: " + order.getRemainingSize() +
+                                    ", available: " + totalAvailable + ")");
+                            iterator.remove();
+                        } else {
+                            System.out.println("Activating Stop Bid Order ID: " + order.getOrderId() + " | Size: " + order.getRemainingSize() + " | Stop Price: " + order.getPrice());
+                            Order market = new Order(order.getOrderId(), "bid", order.getRemainingSize(), 0, "market", order.getOwner());
+                            iterator.remove();
+                            matchMarketOrder(market);
+                        }
                     }
                 }
                 } catch (Exception e) {
